@@ -88,7 +88,8 @@ jobs:
               fi ;;
             node)
               npm prune --omit=dev || true
-              tar -cf - --exclude=.git --exclude=.github --exclude='.env*' . | tar -xf - -C "$OUT" ;;
+              tar -cf - --exclude=.git --exclude=.github --exclude='.env*' . | tar -xf - -C "$OUT"
+              SCRIPT=$(node -e "const s=(require('./package.json').scripts||{}).start||'';const m=s.match(/node\s+(?:--[^\s]+\s+)*([^\s]+\.(?:m?js|cjs))/);process.stdout.write(m?m[1]:'')") ;;
             static)
               D="${{ inputs.static-dir }}"; [ -z "$D" ] && { [ -d dist ] && D=dist || { [ -d build ] && D=build || D=.; }; }
               tar -cf - --exclude=.git --exclude=.github --exclude='.env*' --exclude=node_modules -C "$D" . | tar -xf - -C "$OUT" ;;
