@@ -1,0 +1,110 @@
+# Workflow réutilisable : build sur GitHub, artefact envoyé au VPS, déploiement par vpsctl.
+# Appel depuis un repo :  uses: nod3win/.github/.github/workflows/vpsctl-deploy.yml@main  with: { app: mon-app }  secrets: inherit
+name: vpsctl deploy
+on:
+  workflow_call:
+    inputs:
+      app:          { required: true,  type: string, description: "nom de l'app dans vpsctl" }
+      dir:          { required: false, type: string, default: ".",    description: "sous-dossier du projet (monorepo)" }
+      type:         { required: false, type: string, default: "auto", description: "auto | next | node | static | python" }
+      node-version: { required: false, type: string, default: "22" }
+      build:        { required: false, type: string, default: "",     description: "commande de build (défaut : npm run build si présent)" }
+      static-dir:   { required: false, type: string, default: "",     description: "dossier servi pour type static (défaut : dist ou build)" }
+    secrets:
+      VPS_DEPLOY_KEY: { required: true }
+
+env:
+  VPS_HOST: 167.99.34.75
+  VPS_HOSTKEY: "167.99.34.75 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDQx3tBdOaJrnaIFPxxdbiY0H/arWqwo5+tdaF9pU1wv"
+
+jobs:
+  deploy:
+    name: "${{ inputs.app }}"
+    runs-on: ubuntu-latest
+    concurrency: { group: "vpsctl-${{ inputs.app }}", cancel-in-progress: false }
+    defaults: { run: { working-directory: "${{ inputs.dir }}" } }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clé SSH de déploiement
+        working-directory: .
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_DEPLOY_KEY }}" > ~/.ssh/vpsctl && chmod 600 ~/.ssh/vpsctl
+          echo "$VPS_HOSTKEY" >> ~/.ssh/known_hosts
+          printf 'Host vps\n  HostName %s\n  User root\n  IdentityFile ~/.ssh/vpsctl\n  IdentitiesOnly yes\n' "$VPS_HOST" > ~/.ssh/config
+
+      - name: Détection du type
+        id: detect
+        run: |
+          t="${{ inputs.type }}"
+          if [ "$t" = auto ]; then
+            if [ -f requirements.txt ] || [ -f pyproject.toml ]; then t=python
+            elif [ -f package.json ] && node -e "const p=require('./package.json');process.exit((p.dependencies||{}).next||(p.devDependencies||{}).next?0:1)"; then t=next
+            elif [ -f package.json ] && node -e "const p=require('./package.json');const d={...p.dependencies,...p.devDependencies};process.exit(d.vite||d['react-scripts']||d.astro?0:1)"; then t=static
+            elif [ -f package.json ]; then t=node
+            else t=static; fi
+          fi
+          echo "type=$t" >> "$GITHUB_OUTPUT"
+          echo "Type : $t"
+
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.type != 'python' && hashFiles(format('{0}/package.json', inputs.dir)) != ''
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ hashFiles(format('{0}/package-lock.json', inputs.dir)) != '' && 'npm' || '' }}
+          cache-dependency-path: ${{ inputs.dir }}/package-lock.json
+
+      - name: Variables d'environnement depuis le VPS
+        run: ssh vps "env ${{ inputs.app }}" | tar -xzf - -C . && ls -a | grep -E '^\.env' || echo "(aucun fichier d'env)"
+
+      - name: Install et build
+        if: steps.detect.outputs.type != 'python' && hashFiles(format('{0}/package.json', inputs.dir)) != ''
+        env: { NEXT_TELEMETRY_DISABLED: "1", CI: "1" }
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          if [ -n "${{ inputs.build }}" ]; then bash -c "${{ inputs.build }}"
+          elif node -e "process.exit(require('./package.json').scripts?.build?0:1)"; then npm run build
+          else echo "pas de script build"; fi
+
+      - name: Artefact
+        id: pack
+        run: |
+          set -e
+          T="${{ steps.detect.outputs.type }}"
+          OUT="$RUNNER_TEMP/out"; rm -rf "$OUT"; mkdir -p "$OUT"
+          SCRIPT=""; ARGS=""; INSTALL=""
+          case "$T" in
+            next)
+              if [ -d .next/standalone ]; then
+                cp -a .next/standalone/. "$OUT"/
+                mkdir -p "$OUT/.next"; cp -a .next/static "$OUT/.next/static"
+                [ -d public ] && cp -a public "$OUT/public"
+                SCRIPT="server.js"
+              else
+                npm prune --omit=dev
+                tar -cf - --exclude=.git --exclude=.github --exclude='.env*' --exclude=.next/cache . | tar -xf - -C "$OUT"
+                SCRIPT="node_modules/next/dist/bin/next"; ARGS="start -p __PORT__ -H 127.0.0.1"
+              fi ;;
+            node)
+              npm prune --omit=dev || true
+              tar -cf - --exclude=.git --exclude=.github --exclude='.env*' . | tar -xf - -C "$OUT" ;;
+            static)
+              D="${{ inputs.static-dir }}"; [ -z "$D" ] && { [ -d dist ] && D=dist || { [ -d build ] && D=build || D=.; }; }
+              tar -cf - --exclude=.git --exclude=.github --exclude='.env*' --exclude=node_modules -C "$D" . | tar -xf - -C "$OUT" ;;
+            python)
+              tar -cf - --exclude=.git --exclude=.github --exclude='.env*' --exclude=venv --exclude=__pycache__ . | tar -xf - -C "$OUT"
+              INSTALL="python3 -m venv venv && ./venv/bin/pip install -q -r requirements.txt" ;;
+          esac
+          node -e "
+            const fs=require('fs');
+            fs.writeFileSync(process.argv[1]+'/vpsctl.json', JSON.stringify({ type: '$T', script: '$SCRIPT' || undefined, args: '$ARGS' || undefined, install: '$INSTALL' || undefined, commit_sha: process.env.GITHUB_SHA.slice(0,12), commit_msg: process.env.MSG.slice(0,120), gh_run: process.env.GITHUB_SERVER_URL+'/'+process.env.GITHUB_REPOSITORY+'/actions/runs/'+process.env.GITHUB_RUN_ID }, null, 2));
+          " "$OUT"
+          tar -czf "$RUNNER_TEMP/artifact.tgz" -C "$OUT" .
+          echo "taille : $(du -h "$RUNNER_TEMP/artifact.tgz" | cut -f1)"
+          cat "$OUT/vpsctl.json"
+        env:
+          MSG: ${{ github.event.head_commit.message || github.sha }}
+
+      - name: Déploiement sur le VPS
+        run: ssh vps "deploy ${{ inputs.app }} --gh-run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" < "$RUNNER_TEMP/artifact.tgz"
