@@ -84,7 +84,7 @@ jobs:
               else
                 npm prune --omit=dev
                 tar -cf - --exclude=.git --exclude=.github --exclude='.env*' --exclude=.next/cache . | tar -xf - -C "$OUT"
-                SCRIPT="node_modules/next/dist/bin/next"; ARGS="start -p __PORT__ -H 127.0.0.1"
+                SCRIPT="node_modules/next/dist/bin/next"; ARGS="start -p __PORT__"
               fi ;;
             node)
               npm prune --omit=dev || true
